@@ -1,0 +1,62 @@
+# Build stage for scx-slo scheduler
+FROM ubuntu:24.04 AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    clang \
+    llvm \
+    gcc \
+    make \
+    libbpf-dev \
+    libelf-dev \
+    linux-headers-generic \
+    pkg-config \
+    git \
+    bpftool \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source files
+WORKDIR /build
+COPY src/ ./src/
+COPY Makefile ./
+COPY scx/ ./scx/
+
+# Build the BPF program
+RUN make bpf-only
+
+# Runtime stage - minimal image with just the BPF object
+FROM scratch AS bpf-object
+COPY --from=builder /build/build/scx_slo.bpf.o /scx_slo.bpf.o
+
+# Loader stage - for use with scx_loader from scx project
+FROM ubuntu:24.04 AS loader
+
+RUN apt-get update && apt-get install -y \
+    git \
+    clang \
+    llvm \
+    gcc \
+    make \
+    libbpf-dev \
+    libelf-dev \
+    linux-headers-generic \
+    pkg-config \
+    meson \
+    ninja-build \
+    python3-pip \
+    bpftool \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build scx project to get scx_loader
+WORKDIR /tmp
+RUN git clone https://github.com/sched-ext/scx.git && \
+    cd scx && \
+    meson setup build --prefix /usr && \
+    meson compile -C build scx_loader && \
+    cp build/scheds/rust/scx_loader/scx_loader /usr/bin/
+
+# Copy the BPF object
+COPY --from=builder /build/build/scx_slo.bpf.o /opt/scx_slo.bpf.o
+
+# Default command loads the scheduler
+ENTRYPOINT ["/usr/bin/scx_loader", "/opt/scx_slo.bpf.o"]

@@ -1,0 +1,71 @@
+# frontend.yaml (latency-sensitive)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+      annotations:
+        slo.latency.p99: "200ms"
+    spec:
+      containers:
+      - name: web
+        image: kennethreitz/httpbin
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: default
+spec:
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+  type: LoadBalancer
+---
+# batch.yaml (noisy neighbor)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: batch
+  template:
+    metadata:
+      labels:
+        app: batch
+    spec:
+      containers:
+      - name: stress
+        image: polinux/stress
+        args: ["--cpu", "8", "--timeout", "3600s"]
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "2000m"
+            memory: "512Mi"

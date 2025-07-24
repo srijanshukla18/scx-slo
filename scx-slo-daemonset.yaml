@@ -1,0 +1,74 @@
+# scx-slo DaemonSet for Kubernetes
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: scx-slo-loader
+  namespace: kube-system
+  labels:
+    app: scx-slo
+spec:
+  selector:
+    matchLabels:
+      app: scx-slo
+  template:
+    metadata:
+      labels:
+        app: scx-slo
+    spec:
+      hostPID: true
+      hostNetwork: true
+      containers:
+      - name: loader
+        image: ghcr.io/yourorg/scx-slo-loader:v0.1.0
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: bpffs
+          mountPath: /sys/fs/bpf
+        - name: cgroup
+          mountPath: /sys/fs/cgroup
+        - name: debugfs
+          mountPath: /sys/kernel/debug
+        env:
+        - name: SCX_LOADER_ARGS
+          value: "--cpu-mask=all --pin=/sys/fs/bpf/scx_slo"
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/usr/bin/scx_loader", "stop"]
+      tolerations:
+      - operator: Exists
+      volumes:
+      - name: bpffs
+        hostPath:
+          path: /sys/fs/bpf
+          type: Directory
+      - name: cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+          type: Directory
+      - name: debugfs
+        hostPath:
+          path: /sys/kernel/debug
+          type: DirectoryOrCreate
+---
+# ConfigMap for SLO configurations (future enhancement)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scx-slo-config
+  namespace: kube-system
+data:
+  # Default SLO configurations
+  # Will be read by future sidecar agent
+  default-slo.yaml: |
+    defaultBudgetMs: 100
+    cgroups:
+      # Example: latency-sensitive workloads get 10ms budget
+      - pattern: "*/frontend-*"
+        budgetMs: 10
+        importance: 90
+      # Example: batch jobs get 500ms budget  
+      - pattern: "*/batch-*"
+        budgetMs: 500
+        importance: 10
