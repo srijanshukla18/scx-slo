@@ -73,7 +73,17 @@ RUN bpftool gen skeleton scx_slo.bpf.o > scx_slo.skel.h && \
     gcc scx_slo.o config.o -lbpf -lelf -lz -o scx_slo
 
 # =============================================================================
-# Stage 2: Runtime image
+# Stage 2: K8s Watcher (Go)
+# =============================================================================
+FROM golang:1.22-bookworm AS go-builder
+WORKDIR /build
+COPY src/k8s-watcher/ ./
+RUN go mod init k8s-watcher && \
+    go get github.com/cilium/ebpf k8s.io/client-go/... && \
+    go build -o k8s-watcher main.go
+
+# =============================================================================
+# Stage 3: Runtime image
 # =============================================================================
 FROM debian:bookworm-slim AS runtime
 
@@ -85,12 +95,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user (scheduler still needs CAP_BPF etc, but not root)
-RUN useradd -r -s /bin/false scx-slo
-
 # Copy built artifacts
 COPY --from=builder /build/scx_slo /usr/bin/scx_slo
 COPY --from=builder /build/scx_slo.bpf.o /opt/scx-slo/scx_slo.bpf.o
+COPY --from=go-builder /build/k8s-watcher /usr/bin/k8s-watcher
 
 # Create config directory
 RUN mkdir -p /etc/scx-slo && chown scx-slo:scx-slo /etc/scx-slo

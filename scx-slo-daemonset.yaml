@@ -73,18 +73,15 @@ spec:
         - "-v"
         - "-c"
         securityContext:
-          # Use specific capabilities instead of privileged where possible
-          # Note: privileged is still needed for BPF program loading on most kernels
-          privileged: true
-          # Future: When CAP_BPF is sufficient, use:
-          # privileged: false
-          # capabilities:
-          #   add:
-          #   - BPF
-          #   - SYS_ADMIN
-          #   - PERFMON
-          #   drop:
-          #   - ALL
+          privileged: false
+          capabilities:
+            add:
+            - BPF            # For BPF program loading
+            - PERFMON        # For ring buffer/stats
+            - SYS_ADMIN      # For map pinning/attaching to sched_ext
+            - SYS_RESOURCE   # For map sizing
+            drop:
+            - ALL
         resources:
           requests:
             cpu: "10m"
@@ -92,22 +89,6 @@ spec:
           limits:
             cpu: "100m"
             memory: "128Mi"
-        livenessProbe:
-          exec:
-            command:
-            - /usr/local/bin/healthcheck.sh
-          initialDelaySeconds: 10
-          periodSeconds: 30
-          timeoutSeconds: 5
-          failureThreshold: 3
-        readinessProbe:
-          exec:
-            command:
-            - /usr/local/bin/healthcheck.sh
-          initialDelaySeconds: 5
-          periodSeconds: 10
-          timeoutSeconds: 5
-          failureThreshold: 2
         volumeMounts:
         - name: bpffs
           mountPath: /sys/fs/bpf
@@ -126,13 +107,28 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
-        lifecycle:
-          preStop:
-            exec:
-              command:
-              - /bin/sh
-              - -c
-              - "kill -TERM 1 && sleep 5"
+
+      - name: watcher
+        image: ghcr.io/yourorg/scx-slo-loader:v0.1.0
+        command: ["/usr/bin/k8s-watcher"]
+        securityContext:
+          privileged: false
+          capabilities:
+            add:
+            - BPF            # To write to pinned maps
+            drop:
+            - ALL
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: bpffs
+          mountPath: /sys/fs/bpf
+        - name: cgroup
+          mountPath: /sys/fs/cgroup
+          readOnly: true
 
       tolerations:
       - operator: Exists
@@ -166,14 +162,34 @@ spec:
           name: scx-slo-config
           optional: true
 ---
-# ServiceAccount for scx-slo
+# RBAC for scx-slo Watcher
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: scx-slo
   namespace: kube-system
-  labels:
-    app: scx-slo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: scx-slo-watcher
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: scx-slo-watcher-binding
+subjects:
+- kind: ServiceAccount
+  name: scx-slo
+  namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: scx-slo-watcher
+  apiGroup: rbac.authorization.k8s.io
 ---
 # ConfigMap for SLO configurations
 apiVersion: v1
