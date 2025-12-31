@@ -1,1 +1,20 @@
+# Build artifacts
 build/
+*.o
+*.skel.h
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+*.dSYM/
+core
+vgcore.*
