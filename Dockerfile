@@ -1,4 +1,9 @@
 # scx-slo deployment image
+# Multi-stage build for production deployment
+
+# =============================================================================
+# Stage 1: Build environment
+# =============================================================================
 FROM ubuntu:24.04 AS builder
 
 # Install build dependencies
@@ -13,35 +18,107 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     git \
     bpftool \
+    cargo \
+    rustc \
+    meson \
+    ninja-build \
+    python3-pip \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone scx to get headers and build system
+# Pin to a specific commit for reproducible builds
 WORKDIR /tmp
-RUN git clone https://github.com/sched-ext/scx.git
+ARG SCX_VERSION=v1.0.8
+RUN git clone --depth=1 --branch ${SCX_VERSION} https://github.com/sched-ext/scx.git || \
+    git clone --depth=1 https://github.com/sched-ext/scx.git
 
 # Copy our scheduler source
 WORKDIR /build
-COPY src/scx_slo.bpf.c ./
+COPY src/ ./src/
+COPY include/ ./include/
 COPY Makefile ./
 
-# Create simplified Makefile for just BPF compilation
-RUN echo 'scx_slo.bpf.o: scx_slo.bpf.c' > Makefile.simple && \
-    echo '\tclang -g -O2 -target bpf -D__TARGET_ARCH_x86_64 \\' >> Makefile.simple && \
-    echo '\t  -I/tmp/scx/scheds/include -I/usr/include/bpf \\' >> Makefile.simple && \
-    echo '\t  -c scx_slo.bpf.c -o scx_slo.bpf.o' >> Makefile.simple
+# Detect target architecture
+ARG TARGETARCH=amd64
+RUN if [ "$TARGETARCH" = "amd64" ] || [ "$TARGETARCH" = "x86_64" ]; then \
+        export BPF_TARGET_ARCH=x86_64; \
+    elif [ "$TARGETARCH" = "arm64" ] || [ "$TARGETARCH" = "aarch64" ]; then \
+        export BPF_TARGET_ARCH=arm64; \
+    else \
+        export BPF_TARGET_ARCH=x86_64; \
+    fi && \
+    echo "Building for architecture: $BPF_TARGET_ARCH" && \
+    clang -g -O2 -target bpf -D__TARGET_ARCH_${BPF_TARGET_ARCH} \
+        -I/tmp/scx/scheds/include \
+        -I/usr/include/bpf \
+        -c src/scx_slo.bpf.c -o scx_slo.bpf.o
 
-# Build the BPF object
-RUN make -f Makefile.simple scx_slo.bpf.o
+# Build the full userspace binary
+RUN bpftool gen skeleton scx_slo.bpf.o > scx_slo.skel.h && \
+    gcc -g -O2 -Wall \
+        -I/tmp/scx/scheds/include \
+        -I/usr/include \
+        -I. \
+        -Iinclude \
+        -Isrc \
+        -c src/scx_slo.c -o scx_slo.o && \
+    gcc -g -O2 -Wall \
+        -I/tmp/scx/scheds/include \
+        -I/usr/include \
+        -I. \
+        -Iinclude \
+        -Isrc \
+        -c src/config.c -o config.o && \
+    gcc scx_slo.o config.o -lbpf -lelf -lz -o scx_slo
 
-# Build scx_loader from scx project
-WORKDIR /tmp/scx
-RUN apt-get update && apt-get install -y meson ninja-build python3-pip && \
-    meson setup build --prefix /usr && \
-    cd build && \
-    ninja -C . scheds/rust/scx_loader/scx_loader
+# =============================================================================
+# Stage 2: Runtime image
+# =============================================================================
+FROM debian:bookworm-slim AS runtime
 
-# Final minimal image
-FROM scratch
-COPY --from=builder /build/scx_slo.bpf.o /opt/scx_slo.bpf.o
-COPY --from=builder /tmp/scx/build/scheds/rust/scx_loader/scx_loader /usr/bin/scx_loader
-ENTRYPOINT ["/usr/bin/scx_loader", "/opt/scx_slo.bpf.o"]
+# Install minimal runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libbpf1 \
+    libelf1 \
+    zlib1g \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user (scheduler still needs CAP_BPF etc, but not root)
+RUN useradd -r -s /bin/false scx-slo
+
+# Copy built artifacts
+COPY --from=builder /build/scx_slo /usr/bin/scx_slo
+COPY --from=builder /build/scx_slo.bpf.o /opt/scx-slo/scx_slo.bpf.o
+
+# Create config directory
+RUN mkdir -p /etc/scx-slo && chown scx-slo:scx-slo /etc/scx-slo
+
+# Set permissions
+RUN chmod 755 /usr/bin/scx_slo
+
+# Health check script
+COPY --chmod=755 <<'EOF' /usr/local/bin/healthcheck.sh
+#!/bin/sh
+if [ -f /sys/kernel/sched_ext/state ]; then
+    STATE=$(cat /sys/kernel/sched_ext/state)
+    if [ "$STATE" = "enabled" ]; then
+        OPS=$(cat /sys/kernel/sched_ext/*/ops 2>/dev/null || echo "unknown")
+        if echo "$OPS" | grep -q "scx_slo"; then
+            exit 0
+        fi
+    fi
+fi
+exit 1
+EOF
+
+# Metadata
+LABEL org.opencontainers.image.title="scx-slo"
+LABEL org.opencontainers.image.description="SLO-aware eBPF CPU scheduler"
+LABEL org.opencontainers.image.source="https://github.com/sched-ext/scx-slo"
+LABEL org.opencontainers.image.licenses="GPL-2.0"
+
+# Default entrypoint runs the scheduler with verbose mode and config reload
+ENTRYPOINT ["/usr/bin/scx_slo"]
+CMD ["-v", "-c"]

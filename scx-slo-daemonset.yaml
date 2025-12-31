@@ -1,4 +1,5 @@
 # scx-slo DaemonSet for Kubernetes
+# Deploys the SLO-aware scheduler to all nodes with kernel 6.12+
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -6,22 +7,107 @@ metadata:
   namespace: kube-system
   labels:
     app: scx-slo
+    app.kubernetes.io/name: scx-slo
+    app.kubernetes.io/component: scheduler
 spec:
   selector:
     matchLabels:
       app: scx-slo
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   template:
     metadata:
       labels:
         app: scx-slo
+        app.kubernetes.io/name: scx-slo
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       hostPID: true
       hostNetwork: true
-      containers:
-      - name: loader
-        image: ghcr.io/yourorg/scx-slo-loader:v0.1.0
+      priorityClassName: system-node-critical
+      serviceAccountName: scx-slo
+      terminationGracePeriodSeconds: 30
+
+      # Init container to check kernel version
+      initContainers:
+      - name: kernel-check
+        image: busybox:1.36
+        command:
+        - /bin/sh
+        - -c
+        - |
+          KVER=$(uname -r | cut -d. -f1-2)
+          MAJOR=$(echo $KVER | cut -d. -f1)
+          MINOR=$(echo $KVER | cut -d. -f2)
+          echo "Kernel version: $KVER"
+
+          if [ "$MAJOR" -lt 6 ] || ([ "$MAJOR" -eq 6 ] && [ "$MINOR" -lt 12 ]); then
+            echo "ERROR: Kernel $KVER < 6.12 - sched_ext not supported"
+            exit 1
+          fi
+
+          if [ ! -f /host/sys/kernel/sched_ext/state ]; then
+            echo "ERROR: sched_ext not available. Is CONFIG_SCHED_CLASS_EXT=y?"
+            exit 1
+          fi
+
+          echo "Kernel check passed. sched_ext is available."
         securityContext:
+          privileged: false
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+
+      containers:
+      - name: scheduler
+        image: ghcr.io/yourorg/scx-slo-loader:v0.1.0
+        imagePullPolicy: IfNotPresent
+        args:
+        - "-v"
+        - "-c"
+        securityContext:
+          # Use specific capabilities instead of privileged where possible
+          # Note: privileged is still needed for BPF program loading on most kernels
           privileged: true
+          # Future: When CAP_BPF is sufficient, use:
+          # privileged: false
+          # capabilities:
+          #   add:
+          #   - BPF
+          #   - SYS_ADMIN
+          #   - PERFMON
+          #   drop:
+          #   - ALL
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+        livenessProbe:
+          exec:
+            command:
+            - /usr/local/bin/healthcheck.sh
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+            - /usr/local/bin/healthcheck.sh
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 2
         volumeMounts:
         - name: bpffs
           mountPath: /sys/fs/bpf
@@ -29,15 +115,31 @@ spec:
           mountPath: /sys/fs/cgroup
         - name: debugfs
           mountPath: /sys/kernel/debug
+        - name: sched-ext
+          mountPath: /sys/kernel/sched_ext
+          readOnly: true
+        - name: config
+          mountPath: /etc/scx-slo
+          readOnly: true
         env:
-        - name: SCX_LOADER_ARGS
-          value: "--cpu-mask=all --pin=/sys/fs/bpf/scx_slo"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
         lifecycle:
           preStop:
             exec:
-              command: ["/usr/bin/scx_loader", "stop"]
+              command:
+              - /bin/sh
+              - -c
+              - "kill -TERM 1 && sleep 5"
+
       tolerations:
       - operator: Exists
+        effect: NoSchedule
+      - operator: Exists
+        effect: NoExecute
+
       volumes:
       - name: bpffs
         hostPath:
@@ -51,24 +153,61 @@ spec:
         hostPath:
           path: /sys/kernel/debug
           type: DirectoryOrCreate
+      - name: sched-ext
+        hostPath:
+          path: /sys/kernel/sched_ext
+          type: Directory
+      - name: sys
+        hostPath:
+          path: /sys
+          type: Directory
+      - name: config
+        configMap:
+          name: scx-slo-config
+          optional: true
 ---
-# ConfigMap for SLO configurations (future enhancement)
+# ServiceAccount for scx-slo
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scx-slo
+  namespace: kube-system
+  labels:
+    app: scx-slo
+---
+# ConfigMap for SLO configurations
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: scx-slo-config
   namespace: kube-system
+  labels:
+    app: scx-slo
 data:
-  # Default SLO configurations
-  # Will be read by future sidecar agent
-  default-slo.yaml: |
-    defaultBudgetMs: 100
-    cgroups:
-      # Example: latency-sensitive workloads get 10ms budget
-      - pattern: "*/frontend-*"
-        budgetMs: 10
-        importance: 90
-      # Example: batch jobs get 500ms budget  
-      - pattern: "*/batch-*"
-        budgetMs: 500
-        importance: 10
+  # SLO configuration file
+  # Format: cgroup_path budget_ms importance
+  config: |
+    # Default SLO configurations for Kubernetes workloads
+    #
+    # Critical workloads: 20ms budget, high importance
+    # /kubepods/burstable 50 80
+    # /kubepods/guaranteed 20 95
+    #
+    # Batch workloads: 500ms budget, low importance
+    # /kubepods/besteffort 500 20
+    #
+    # Add your workload-specific SLOs below:
+---
+# PodDisruptionBudget to ensure scheduler availability during node drains
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: scx-slo-pdb
+  namespace: kube-system
+  labels:
+    app: scx-slo
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: scx-slo

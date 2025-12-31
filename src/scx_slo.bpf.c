@@ -18,6 +18,11 @@
 
 char _license[] SEC("license") = "GPL";
 
+/* Maximum value for u64 - used for overflow protection */
+#ifndef U64_MAX
+#define U64_MAX ((u64)~0ULL)
+#endif
+
 /* SLO configuration per cgroup */
 struct slo_cfg {
 	u64 budget_ns;      /* Latency budget in nanoseconds */
@@ -218,7 +223,7 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 	
 	/* Get validated budget for this cgroup */
 	u64 budget_ns = get_safe_budget(cg_id);
-	
+
 	/* Get or create task context */
 	struct slo_task_ctx *ctx = get_task_ctx(pid);
 	if (!ctx) {
@@ -226,9 +231,19 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
 		return;
 	}
-	
-	/* Calculate proper deadline = enqueue_time + budget */
-	u64 deadline = now + budget_ns;
+
+	/*
+	 * Calculate deadline with overflow protection.
+	 * If now + budget_ns would overflow, cap at U64_MAX.
+	 * This prevents wrapping around to a deadline in the past.
+	 */
+	u64 deadline;
+	if (budget_ns > U64_MAX - now) {
+		/* Overflow would occur, saturate at maximum */
+		deadline = U64_MAX;
+	} else {
+		deadline = now + budget_ns;
+	}
 	
 	/* Store context properly instead of abusing dsq_vtime */
 	ctx->deadline = deadline;
