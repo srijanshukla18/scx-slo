@@ -40,12 +40,7 @@
 #define MSG_NOSIGNAL 0x4000
 #endif
 
-/* Deadline event structure - must match BPF side */
-struct deadline_event {
-	__u64 cgroup_id;
-	__u64 deadline_miss_ns;
-	__u64 timestamp;
-};
+/* Note: struct deadline_event is defined in include/scx_slo.h (via config.h) */
 
 /* Log levels */
 enum log_level {
@@ -87,6 +82,7 @@ static bool reload_config;
 static bool json_logging = false;
 static enum log_level current_log_level = LOG_INFO;
 static int health_port = 8080;
+static const char *health_bind_addr = "127.0.0.1"; /* loopback by default */
 static volatile sig_atomic_t exit_req = 0;
 static volatile sig_atomic_t scheduler_attached = 0;
 
@@ -349,8 +345,13 @@ static int start_health_server(void)
 	struct sockaddr_in addr = {
 		.sin_family = AF_INET,
 		.sin_port = htons(health_port),
-		.sin_addr.s_addr = INADDR_ANY
 	};
+	if (inet_pton(AF_INET, health_bind_addr, &addr.sin_addr) != 1) {
+		log_msg(LOG_ERROR, "Invalid bind address for health server: %s", health_bind_addr);
+		close(health_server_fd);
+		health_server_fd = -1;
+		return -1;
+	}
 
 	if (bind(health_server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		log_msg(LOG_ERROR, "Failed to bind to port %d: %s", health_port, strerror(errno));
@@ -432,7 +433,7 @@ static int handle_deadline_event(void *ctx, void *data, size_t data_sz)
 	return 0;
 }
 
-static void read_stats(struct scx_slo *skel, __u64 *stats)
+static void read_stats(struct scx_slo_bpf *skel, __u64 *stats)
 {
 	int nr_cpus = libbpf_num_possible_cpus();
 	assert(nr_cpus > 0);
@@ -470,7 +471,7 @@ static enum log_level parse_log_level(const char *level)
 
 int main(int argc, char **argv)
 {
-	struct scx_slo *skel = NULL;
+	struct scx_slo_bpf *skel = NULL;
 	struct bpf_link *link = NULL;
 	struct ring_buffer *rb = NULL;
 	int opt;
@@ -496,8 +497,13 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* Allow overriding health bind address via env */
+	const char *bind_env = getenv("SCX_SLO_HEALTH_ADDR");
+	if (bind_env && strlen(bind_env) > 0)
+		health_bind_addr = bind_env;
+
 restart:
-	skel = SCX_OPS_OPEN(slo_ops, scx_slo);
+	skel = SCX_OPS_OPEN(slo_ops, scx_slo_bpf);
 
 	while ((opt = getopt(argc, argv, "vcp:jl:h")) != -1) {
 		switch (opt) {
@@ -525,13 +531,18 @@ restart:
 	/* Reset getopt for potential restart */
 	optind = 1;
 
-	err = SCX_OPS_LOAD(skel, slo_ops, scx_slo, uei);
-	if (err) {
-		log_msg(LOG_ERROR, "Failed to load BPF program: %d", err);
+	/* SCX_OPS_LOAD uses SCX_BUG_ON internally - aborts on failure */
+	SCX_OPS_LOAD(skel, slo_ops, scx_slo_bpf, uei);
+	log_msg(LOG_INFO, "BPF skeleton loaded successfully");
+
+	/* Pin all maps so other components (watcher) can access slo_map */
+	err = bpf_object__pin_maps(skel->obj, "/sys/fs/bpf");
+	if (err && err != -EEXIST) {
+		log_msg(LOG_ERROR, "Failed to pin BPF maps: %d", err);
 		goto cleanup;
 	}
 
-	link = SCX_OPS_ATTACH(skel, slo_ops, scx_slo);
+	link = SCX_OPS_ATTACH(skel, slo_ops, scx_slo_bpf);
 	if (!link) {
 		log_msg(LOG_ERROR, "Failed to attach BPF program");
 		err = -1;
@@ -629,7 +640,7 @@ cleanup:
 
 	if (skel) {
 		ecode = UEI_REPORT(skel, uei);
-		scx_slo__destroy(skel);
+		scx_slo_bpf__destroy(skel);
 		skel = NULL;
 		log_msg(LOG_INFO, "BPF scheduler detached successfully");
 

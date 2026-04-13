@@ -10,9 +10,8 @@
 #ifdef __KERNEL__
 #include <linux/types.h>
 #else
-#include <stdint.h>
-typedef uint64_t __u64;
-typedef uint32_t __u32;
+/* Use linux/types.h for userspace to match BPF/libbpf expectations */
+#include <linux/types.h>
 #endif
 
 /* SLO configuration per cgroup */

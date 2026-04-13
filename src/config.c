@@ -82,11 +82,11 @@ static int validate_cgroup_path(const char *path)
 	for (size_t i = 0; i < strlen(path); i++) {
 		if (path[i] == '\0')
 			break;
-		/* Allow alphanumeric, /, -, _, . */
+		/* Allow alphanumeric, /, -, _, ., @, : */
 		char c = path[i];
 		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 		      (c >= '0' && c <= '9') || c == '/' || c == '-' ||
-		      c == '_' || c == '.')) {
+		      c == '_' || c == '.' || c == '@' || c == ':')) {
 			fprintf(stderr, "Error: Invalid character '%c' in cgroup path: %s\n", c, path);
 			return -1;
 		}

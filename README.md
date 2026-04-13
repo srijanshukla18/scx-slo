@@ -33,6 +33,19 @@ When nodes hit 100% CPU, standard Linux scheduling (CFS) treats every process "f
 2.  **K8s Native Integration**: A Go-based sidecar (`watcher`) tracks Pods on the node and automatically translates `scx-slo/` annotations into kernel-side configs.
 3.  **Cgroup Resolution**: The watcher dynamically resolves Pod UIDs to 64-bit Kernel Cgroup IDs using `name_to_handle_at()`.
 
+## Container Image
+
+Pre-built multi-arch images (amd64/arm64) available on GHCR:
+
+```bash
+docker pull ghcr.io/srijanshukla18/scx-slo:latest
+```
+
+Or pin to a specific version:
+```bash
+docker pull ghcr.io/srijanshukla18/scx-slo:v0.1.0
+```
+
 ## Deployment
 
 Deploy the scheduler and watcher to all nodes (Linux 6.12+ required):

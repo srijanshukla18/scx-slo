@@ -310,10 +310,12 @@ static void test_dsq_priority_ordering(void)
 	printf("Testing DSQ priority ordering (EDF)...\n");
 
 	/* Simulate multiple tasks with different deadlines */
-	struct {
-		uint32_t pid;
-		uint64_t deadline;
-	} tasks[] = {
+struct task_deadline {
+    uint32_t pid;
+    uint64_t deadline;
+};
+
+struct task_deadline tasks[] = {
 		{1001, NSEC_PER_SEC + 100 * NSEC_PER_MSEC},  /* 1.1s */
 		{1002, NSEC_PER_SEC + 50 * NSEC_PER_MSEC},   /* 1.05s - earliest */
 		{1003, NSEC_PER_SEC + 200 * NSEC_PER_MSEC},  /* 1.2s */
@@ -321,13 +323,13 @@ static void test_dsq_priority_ordering(void)
 	};
 
 	/* In EDF, task with earliest deadline should run first */
-	uint32_t expected_order[] = {1002, 1004, 1001, 1003};
+    uint32_t expected_order[] = {1002, 1004, 1001, 1003};
 
 	/* Simple bubble sort to simulate priority queue */
 	for (size_t i = 0; i < 4; i++) {
 		for (size_t j = i + 1; j < 4; j++) {
 			if (tasks[j].deadline < tasks[i].deadline) {
-				struct { uint32_t pid; uint64_t deadline; } tmp = tasks[i];
+                struct task_deadline tmp = tasks[i];
 				tasks[i] = tasks[j];
 				tasks[j] = tmp;
 			}

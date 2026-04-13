@@ -18,3 +18,4 @@ Thumbs.db
 *.dSYM/
 core
 vgcore.*
+build-push.sh

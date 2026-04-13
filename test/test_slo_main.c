@@ -16,13 +16,6 @@
 #define NSEC_PER_MSEC 1000000ULL
 #define NSEC_PER_SEC  1000000000ULL
 
-/* Mock deadline event structure (from scx_slo.c) */
-struct deadline_event {
-	uint64_t cgroup_id;
-	uint64_t deadline_miss_ns;
-	uint64_t timestamp;
-};
-
 /* ns_to_ms function from scx_slo.c */
 static double ns_to_ms(uint64_t ns)
 {

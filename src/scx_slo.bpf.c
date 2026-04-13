@@ -15,13 +15,59 @@
  * Based on scx_simple scheduler framework.
  */
 #include <scx/common.bpf.h>
+/* Note: struct cgroup and other kernel types come from vmlinux.h,
+ * which is included by scx/common.bpf.h */
 
 char _license[] SEC("license") = "GPL";
+
+/* ============================================================================
+ * Constants - MUST be defined before maps that reference them
+ * ============================================================================ */
 
 /* Maximum value for u64 - used for overflow protection */
 #ifndef U64_MAX
 #define U64_MAX ((u64)~0ULL)
 #endif
+
+/* Time constants (if not provided by vmlinux.h) */
+#ifndef NSEC_PER_MSEC
+#define NSEC_PER_MSEC 1000000ULL
+#endif
+#ifndef NSEC_PER_SEC
+#define NSEC_PER_SEC 1000000000ULL
+#endif
+
+/* Map sizing constants */
+#define MAX_CGROUPS 10000
+#define MAX_TASKS 100000
+#define RINGBUF_SIZE (1 << 20)   /* 1MB */
+#define STATS_MAP_ENTRIES 2      /* [local, global] */
+#define RATE_LIMIT_MAP_ENTRIES 2 /* [event_count, window_start] */
+
+/* Scheduling constants and DSQ definitions */
+#define SHARED_DSQ 0
+#define LOCAL_DSQ_ID 1
+
+/* SLO budget constants with validation bounds */
+#define DEFAULT_BUDGET_NS (100 * NSEC_PER_MSEC) /* 100ms default */
+#define MIN_BUDGET_NS (1 * NSEC_PER_MSEC)       /* 1ms minimum */
+#define MAX_BUDGET_NS (10 * NSEC_PER_SEC)       /* 10s maximum */
+
+/* Importance value bounds */
+#define MIN_IMPORTANCE 1
+#define MAX_IMPORTANCE 100
+
+/* Rate limiting for ring buffer events */
+#define MAX_EVENTS_PER_SEC 1000
+#define RATE_LIMIT_WINDOW_NS (1 * NSEC_PER_SEC)
+
+/* Security constants */
+#define SLO_MAP_UPDATE_CAP_SYS_ADMIN 1
+#define SLO_MAP_UPDATE_CAP_BPF 2
+
+/* ============================================================================
+ * Data Structures
+ * ============================================================================ */
 
 /* SLO configuration per cgroup */
 struct slo_cfg {
@@ -76,38 +122,9 @@ struct deadline_event {
   u64 timestamp;
 };
 
-/* SLO budget constants with validation bounds */
-#define DEFAULT_BUDGET_NS (100 * NSEC_PER_MSEC) /* 100ms default */
-#define MIN_BUDGET_NS (1 * NSEC_PER_MSEC)       /* 1ms minimum */
-#define MAX_BUDGET_NS (10 * NSEC_PER_SEC)       /* 10s maximum */
-
-/* Importance value bounds */
-#define MIN_IMPORTANCE 1
-#define MAX_IMPORTANCE 100
-
-/* Rate limiting for ring buffer events */
-#define MAX_EVENTS_PER_SEC 1000
-#define RATE_LIMIT_WINDOW_NS (1 * NSEC_PER_SEC)
-
-/* Security constants */
-#define SLO_MAP_UPDATE_CAP_SYS_ADMIN 1
-#define SLO_MAP_UPDATE_CAP_BPF 2
-
 UEI_DEFINE(uei);
 
-/*
- * Scheduling constants and DSQ definitions
- */
-#define SHARED_DSQ 0
-#define LOCAL_DSQ_ID 1
-
-/* Map sizing constants */
-#define MAX_CGROUPS 10000
-#define MAX_TASKS 100000
-#define RINGBUF_SIZE (1 << 20)   /* 1MB */
-#define STATS_MAP_ENTRIES 2      /* [local, global] */
-#define RATE_LIMIT_MAP_ENTRIES 2 /* [event_count, window_start] */
-
+/* Stats map for local/global counters */
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(key_size, sizeof(u32));
@@ -200,11 +217,7 @@ s32 BPF_STRUCT_OPS(simple_select_cpu, struct task_struct *p, s32 prev_cpu,
   s32 cpu;
 
   cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-  if (is_idle) {
-    stat_inc(0); /* count local queueing */
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-  }
-
+  /* Let enqueue handle placement; avoid double-insert. */
   return cpu;
 }
 
@@ -212,17 +225,25 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags) {
   stat_inc(1); /* count global queueing */
 
   u32 pid = p->pid;
-  u64 cg_id = bpf_get_current_cgroup_id();
+  u64 cg_id = 0;
+  struct cgroup *cgrp = scx_bpf_task_cgroup(p);
+  if (cgrp) {
+    if (cgrp->kn)
+      cg_id = cgrp->kn->id;
+    bpf_cgroup_release(cgrp);
+  } else {
+    cg_id = bpf_get_current_cgroup_id();
+  }
   u64 now = bpf_ktime_get_ns();
 
   /* Get validated budget for this cgroup */
   u64 budget_ns = get_safe_budget(cg_id);
 
   /* Get or create task context */
-  struct slo_task_ctx *ctx = get_task_ctx(pid);
-  if (!ctx) {
+  struct slo_task_ctx *task_ctx = get_task_ctx(pid);
+  if (!task_ctx) {
     /* Fallback: use default scheduling without context */
-    scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+    scx_bpf_dispatch(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
     return;
   }
 
@@ -252,42 +273,42 @@ void BPF_STRUCT_OPS(simple_enqueue, struct task_struct *p, u64 enq_flags) {
   }
 
   /* Store context properly instead of abusing dsq_vtime */
-  ctx->deadline = deadline;
-  ctx->budget_ns = budget_ns;
-  ctx->start_time = 0; /* Will be set when task starts running */
-  ctx->valid = 1;
+  task_ctx->deadline = deadline;
+  task_ctx->budget_ns = budget_ns;
+  task_ctx->start_time = 0; /* Will be set when task starts running */
+  task_ctx->valid = 1;
 
   /* Insert task with deadline as vtime for earliest-deadline-first */
-  scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, deadline, enq_flags);
+  scx_bpf_dispatch_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, deadline, enq_flags);
 }
 
 void BPF_STRUCT_OPS(simple_dispatch, s32 cpu, struct task_struct *prev) {
-  scx_bpf_dsq_move_to_local(SHARED_DSQ);
+  scx_bpf_consume(SHARED_DSQ);
 }
 
 void BPF_STRUCT_OPS(simple_running, struct task_struct *p) {
   u32 pid = p->pid;
-  struct slo_task_ctx *ctx = get_task_ctx(pid);
+  struct slo_task_ctx *task_ctx = get_task_ctx(pid);
 
-  if (ctx && ctx->valid) {
+  if (task_ctx && task_ctx->valid) {
     /* Record when task actually started running */
-    ctx->start_time = bpf_ktime_get_ns();
+    task_ctx->start_time = bpf_ktime_get_ns();
   }
 }
 
 void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable) {
   u32 pid = p->pid;
   u64 now = bpf_ktime_get_ns();
-  struct slo_task_ctx *ctx = bpf_map_lookup_elem(&task_ctx_map, &pid);
+  struct slo_task_ctx *task_ctx = bpf_map_lookup_elem(&task_ctx_map, &pid);
 
-  if (!ctx || !ctx->valid)
+  if (!task_ctx || !task_ctx->valid)
     return;
 
   /* CORRECT deadline miss detection: check if current time > original deadline
    */
-  if (now > ctx->deadline) {
+  if (now > task_ctx->deadline) {
     u64 cg_id = bpf_get_current_cgroup_id();
-    u64 miss_duration = now - ctx->deadline;
+    u64 miss_duration = now - task_ctx->deadline;
 
     /* Report deadline miss with rate limiting to prevent spam */
     if (!is_rate_limited()) {
@@ -311,9 +332,7 @@ void BPF_STRUCT_OPS(simple_stopping, struct task_struct *p, bool runnable) {
 void BPF_STRUCT_OPS(simple_enable, struct task_struct *p) {
   /* Initialize task context for new tasks */
   u32 pid = p->pid;
-  struct slo_task_ctx *ctx = get_task_ctx(pid);
-
-  /* Context will be properly initialized in enqueue */
+  (void)get_task_ctx(pid); /* Pre-allocate context, initialized in enqueue */
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(simple_init) {

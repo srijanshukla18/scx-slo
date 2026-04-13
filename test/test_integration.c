@@ -33,13 +33,6 @@ struct task_ctx_entry {
 	int in_use;
 };
 
-/* Simulated deadline event */
-struct deadline_event {
-	uint64_t cgroup_id;
-	uint64_t deadline_miss_ns;
-	uint64_t timestamp;
-};
-
 /* Global simulation state */
 static struct slo_map_entry slo_map[MAX_TEST_CGROUPS];
 static struct task_ctx_entry task_map[MAX_TEST_TASKS];
